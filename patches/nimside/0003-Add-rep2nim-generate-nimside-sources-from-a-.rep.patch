@@ -1,0 +1,832 @@
+From adce40db4bbfe9d0e84b00e59a6e3ea13d260545 Mon Sep 17 00:00:00 2001
+From: Dario Gabriel Lipicar <lipigl@gmail.com>
+Date: Thu, 30 Jul 2026 00:19:38 -0300
+Subject: [PATCH 3/3] Add rep2nim: generate nimside sources from a .rep
+
+repc turns a Qt Remote Objects .rep into a C++ source-side class. rep2nim does
+the same for nimside, so a single .rep can define an interface shared between a
+Nim implementation and any number of C++/QML replicas -- including, usefully, a
+Nim object remoted dynamically and consumed through a repc-generated typed
+replica.
+
+Output is a complete `qobject:` block with an `include` of the author's module
+spliced in ahead of the slots that forward to it. That placement is what lets
+plain, pragma-less procs see both the generated type and its generated property
+accessors; `qobject:` already passes such procs through untouched.
+
+Two mappings are load-bearing and easy to get wrong by hand, which is much of
+the reason to generate rather than write this:
+
+  * .rep `int` is Qt's int, so it maps to `int32`. Nim's `int` is 64-bit and
+    would reach the meta object as qlonglong, silently mismatching every
+    replica built from the same .rep.
+
+  * READONLY constrains the replica, not the source: the source still needs a
+    setter to publish changes. Only CONSTANT yields neither setter nor notify.
+
+Declaration order is preserved, because that is what QtRemoteObjects'
+DynamicApiMap derives its property/signal/method indices from.
+
+Scope is class/PROP/SLOT/SIGNAL. POD, MODEL, ENUM, nested CLASS and USE_ENUM are
+rejected by name with a line number rather than mis-generated -- ENUM because
+nimside does not emit enums into the meta object yet. Replica-side generation
+is not implemented.
+
+tests/test_all: 46 OK.
+---
+ README.md               |  49 +++++
+ nimside.nimble          |   2 +
+ src/nimside/rep2nim.nim | 394 ++++++++++++++++++++++++++++++++++++++++
+ src/rep2nim.nim         |  85 +++++++++
+ tests/test_all.nim      |   3 +-
+ tests/test_rep2nim.nim  | 206 +++++++++++++++++++++
+ 6 files changed, 738 insertions(+), 1 deletion(-)
+ create mode 100644 src/nimside/rep2nim.nim
+ create mode 100644 src/rep2nim.nim
+ create mode 100644 tests/test_rep2nim.nim
+
+diff --git a/README.md b/README.md
+index 97a6616..b93024e 100644
+--- a/README.md
++++ b/README.md
+@@ -62,6 +62,55 @@ discard QApplication.exec()
+ 
+ See [`nim-seaqt`](https://github.com/seaqt/nim-seaqt) for more information.
+ 
++## `rep2nim`
++
++`rep2nim` is to `nimside` what [`repc`](https://doc.qt.io/qt-6/qtremoteobjects-repc.html) is to C++: it turns a [Qt Remote Objects](https://doc.qt.io/qt-6/qtremoteobjects-index.html) `.rep` file into the source-side object, so one `.rep` can define an interface shared between a Nim implementation and any number of C++ or QML replicas.
++
++```sh
++rep2nim counter.rep --stub    # -> counter_rep.nim, counter_impl.nim
++```
++
++Given
++
++```
++class Counter
++{
++    PROP(int count READONLY)
++
++    SLOT(void increment())
++}
++```
++
++it writes a complete `qobject:` block:
++
++```nim
++qobject:
++  type
++    Counter* = ref object of VirtualQObject
++      count {.qproperty(write = true, notify = true).}: int32
++
++  include "counter_impl"
++
++  proc increment*(self: Counter) {.slot.} =
++    self.incrementImpl()
++```
++
++You supply the bodies in `counter_impl.nim`, as ordinary procs with no pragmas — `qobject:` passes anything that is neither a slot nor a signal through untouched, and the `include` splices them in ahead of the slots that call them, so they can see the generated type and its property accessors:
++
++```nim
++proc incrementImpl*(self: Counter) =
++  self.setCount(self.count + 1'i32)
++```
++
++Declaration order is preserved throughout, because that is what the meta object — and therefore anything reading it, including `QtRemoteObjects`' `DynamicApiMap` — keys off.
++
++Two things are worth knowing:
++
++* **`.rep` `int` becomes Nim `int32`, never `int`.** Nim's `int` is 64-bit and would reach the meta object as `qlonglong`, silently mismatching every replica generated from the same `.rep`.
++* **`READONLY` constrains the replica, not the source.** The generated source still gets a setter, since it is what publishes changes; only `CONSTANT` produces neither setter nor notify signal.
++
++`class`, `PROP`, `SLOT` and `SIGNAL` are supported. `POD`, `MODEL`, `ENUM`, nested `CLASS` and `USE_ENUM` are rejected by name rather than quietly dropped — `ENUM` in particular because `nimside` does not yet emit enums into the meta object. Replica-side generation is not implemented.
++
+ ## Related projects
+ 
+ `nimside` was inspired by [`nimqml`](https://github.com/filcuc/nimqml) which offers a similar DSL based on [`DOtherSide`](https://github.com/filcuc/dotherside).
+diff --git a/nimside.nimble b/nimside.nimble
+index c72ec96..fe94288 100644
+--- a/nimside.nimble
++++ b/nimside.nimble
+@@ -5,6 +5,8 @@ author = "The seaqt authors"
+ description = "Nim Qt/QML integration"
+ license = "MIT"
+ srcDir = "src"
++bin = @["rep2nim"]
++installExt = @["nim"]
+ 
+ # Dependencies
+ 
+diff --git a/src/nimside/rep2nim.nim b/src/nimside/rep2nim.nim
+new file mode 100644
+index 0000000..f50140c
+--- /dev/null
++++ b/src/nimside/rep2nim.nim
+@@ -0,0 +1,394 @@
++## rep2nim -- generate nimside sources from a Qt Remote Objects `.rep` file.
++##
++## This is to nimside what `repc -o source` is to C++: given a replica
++## definition, emit the source-side object so that a `.rep` can be the single
++## definition of an interface shared between a Nim implementation and any
++## number of C++/QML replicas.
++##
++## What comes out is a complete `qobject:` block -- the type, its properties,
++## its signals and its slots -- where each slot body forwards to a proc you
++## write:
++##
++## .. code-block:: nim
++##   qobject:
++##     type Counter* = ref object of VirtualQObject
++##       count {.qproperty(write = true, notify = true).}: int32
++##
++##     include "counter_impl"
++##
++##     proc increment(self: Counter) {.slot.} =
++##       self.incrementImpl()
++##
++## The `include` splices your implementations into the block ahead of the slots
++## that call them, which is what makes them able to see both the generated type
++## and its generated property accessors. Write them as ordinary procs with no
++## pragmas -- `qobject:` passes anything that is neither a slot nor a signal
++## through untouched:
++##
++## .. code-block:: nim
++##   proc incrementImpl(self: Counter) =
++##     self.setCount(self.count + 1'i32)
++##
++## Declaration order is preserved throughout, because that is what the Qt meta
++## object -- and therefore anything reading it, `QtRemoteObjects`'
++## `DynamicApiMap` included -- keys off.
++
++import std/[algorithm, os, strformat, strutils, tables]
++
++type
++  Rep2NimError* = object of CatchableError ## Raised for anything malformed or
++                                           ## not yet supported. `line` is
++                                           ## 1-based, 0 when not tied to one.
++    line*: int
++
++  PropAccess* = enum
++    ## How a `PROP` may be reached. This describes the *replica* side; the
++    ## source always needs some way to set the value, so `Constant` is the only
++    ## one that produces no setter.
++    ReadWrite ## default
++    ReadOnly ## `READONLY` -- replica cannot write it
++    Constant ## `CONSTANT` -- never changes, so no setter and no notify
++
++  Param* = object
++    name*: string
++    typ*: string ## already mapped to Nim
++
++  Prop* = object
++    name*: string
++    typ*: string ## already mapped to Nim
++    access*: PropAccess
++
++  Method* = object
++    name*: string
++    returnType*: string ## already mapped to Nim; "void" for signals
++    params*: seq[Param]
++
++  Class* = object
++    name*: string
++    props*: seq[Prop]
++    signals*: seq[Method]
++    slots*: seq[Method]
++
++  Rep* = object
++    classes*: seq[Class]
++
++const
++  qtToNim = {
++    "void": "void",
++    "bool": "bool",
++    # .rep `int` is Qt's int, i.e. 32-bit. Nim's `int` is 64-bit and would land
++    # in the meta object as qlonglong, which silently mismatches every replica
++    # generated from the same .rep -- so never map anything to plain `int`.
++    "int": "int32",
++    "qint32": "int32",
++    "uint": "uint32",
++    "unsigned int": "uint32",
++    "quint32": "uint32",
++    "qint8": "int8",
++    "signed char": "int8",
++    "quint8": "uint8",
++    "uchar": "uint8",
++    "unsigned char": "uint8",
++    "short": "int16",
++    "qint16": "int16",
++    "ushort": "uint16",
++    "unsigned short": "uint16",
++    "quint16": "uint16",
++    "qint64": "int64",
++    "qlonglong": "int64",
++    "long long": "int64",
++    "quint64": "uint64",
++    "qulonglong": "uint64",
++    "unsigned long long": "uint64",
++    "float": "float32",
++    "double": "float64",
++    "qreal": "float64",
++    "QString": "string",
++    "QStringList": "seq[string]",
++  }.toTable
++
++  # Recognised by repc, deliberately not handled here rather than mis-generated.
++  unsupportedKeywords = {
++    "POD": "POD types have no nimside equivalent yet",
++    "MODEL":
++      "MODEL requires a QAbstractItemModel source, which nimside cannot express",
++    "CLASS": "nested CLASS sub-objects are not supported yet",
++    "USE_ENUM": "USE_ENUM is not supported yet",
++    "ENUM":
++      "nimside does not emit enums into the meta object yet, so an ENUM here " &
++      "would be silently dropped",
++  }.toTable
++
++proc err(line: int, msg: string) {.noreturn.} =
++  var e = newException(Rep2NimError, msg)
++  e.line = line
++  raise e
++
++proc mapType(line: int, qtType: string): string =
++  let t = qtType.strip()
++  if t.len == 0:
++    err(line, "empty type")
++  if t in qtToNim:
++    return qtToNim[t]
++  var supported: seq[string]
++  for k in qtToNim.keys:
++    supported.add k
++  sort(supported)
++  err(
++    line,
++    &"unsupported type '{t}'. rep2nim maps: " & supported.join(", ") &
++      ". Anything else would fall through to nimside's runtime metatype lookup " &
++      "and not match the replica.",
++  )
++
++proc splitTopLevel(s: string, sep: char): seq[string] =
++  ## Split on `sep`, ignoring separators nested inside <> (for QList<int> and
++  ## friends -- rejected later by mapType, but they must at least tokenise).
++  var depth = 0
++  var cur = ""
++  for c in s:
++    case c
++    of '<': inc depth; cur.add c
++    of '>': dec depth; cur.add c
++    else:
++      if c == sep and depth == 0:
++        result.add cur
++        cur = ""
++      else:
++        cur.add c
++  if cur.strip().len > 0 or result.len > 0:
++    result.add cur
++
++proc parseParams(line: int, inner: string): seq[Param] =
++  ## `int a, QString b` -> params. Unnamed parameters get positional names.
++  let body = inner.strip()
++  if body.len == 0:
++    return
++  for i, raw in splitTopLevel(body, ','):
++    let part = raw.strip()
++    if part.len == 0:
++      err(line, "empty parameter")
++    let sp = part.rfind(' ')
++    if sp < 0:
++      # A bare type with no name, e.g. SLOT(void fn(int)).
++      result.add Param(name: &"arg{i}", typ: mapType(line, part))
++    else:
++      result.add Param(
++        name: part[sp + 1 .. ^1].strip(), typ: mapType(line, part[0 ..< sp])
++      )
++
++proc parseCallable(line: int, inner: string, isSignal: bool): Method =
++  ## `void increment()` / `int add(int a, int b)` / `changed(int v)` for signals.
++  let open = inner.find('(')
++  let close = inner.rfind(')')
++  if open < 0 or close < open:
++    err(line, "expected `name(...)`, got: " & inner)
++
++  let head = inner[0 ..< open].strip()
++  result.params = parseParams(line, inner[open + 1 ..< close])
++
++  if isSignal:
++    # Signals have no return type in a .rep.
++    if head.contains(' '):
++      err(line, "a SIGNAL must not declare a return type: " & inner)
++    result.name = head
++    result.returnType = "void"
++  else:
++    let sp = head.rfind(' ')
++    if sp < 0:
++      err(line, "a SLOT must declare a return type, e.g. `void " & head & "()`")
++    result.name = head[sp + 1 .. ^1].strip()
++    result.returnType = mapType(line, head[0 ..< sp])
++
++  if result.name.len == 0:
++    err(line, "missing name in: " & inner)
++
++proc parseProp(line: int, inner: string): Prop =
++  ## `int count READONLY`, `QString name`, `int x=5`.
++  var body = inner.strip()
++
++  # Strip a default value; the source-side object initialises its own fields.
++  let eq = body.find('=')
++  if eq >= 0:
++    body = body[0 ..< eq].strip()
++
++  var words: seq[string]
++  for w in body.splitWhitespace():
++    words.add w
++  if words.len < 2:
++    err(line, "expected `PROP(<type> <name> [flags])`, got: " & inner)
++
++  result.access = ReadWrite
++  var consumed = words.len
++  # Trailing flags, in any order.
++  while consumed > 2:
++    case words[consumed - 1].toUpperAscii()
++    of "READONLY": result.access = ReadOnly
++    of "CONSTANT": result.access = Constant
++    of "READWRITE", "SOURCEONLYSETTER", "PERSISTED": discard
++    else:
++      err(line, "unknown PROP flag '" & words[consumed - 1] & "'")
++    dec consumed
++
++  result.name = words[consumed - 1]
++  result.typ = mapType(line, words[0 ..< consumed - 1].join(" "))
++
++proc parseRep*(source, filename: string): Rep =
++  ## Parse a `.rep`. Only the subset rep2nim can faithfully represent is
++  ## accepted; everything else repc understands is rejected by name so it
++  ## cannot be silently dropped.
++  var cur: Class
++  var inClass = false
++
++  var lineNo = 0
++  for rawLine in source.splitLines():
++    inc lineNo
++    var line = rawLine
++
++    # Comments.
++    let hash = line.find('#')
++    if hash == 0:
++      continue # #include and friends: irrelevant to the Nim side
++    let slashes = line.find("//")
++    if slashes >= 0:
++      line = line[0 ..< slashes]
++    line = line.strip()
++    if line.len == 0:
++      continue
++
++    # The leading keyword, however the declaration continues -- `ENUM E { .. }`
++    # carries no parentheses and `MODEL m(role)` puts the name before them, so
++    # neither can be recognised by splitting on '('.
++    let keyword = line.splitWhitespace()[0].split('(')[0]
++    if keyword in unsupportedKeywords:
++      err(lineNo, &"`{keyword}` is not supported by rep2nim: " &
++        unsupportedKeywords[keyword])
++
++    if not inClass:
++      if keyword == "class":
++        let name = line[5 .. ^1].strip().strip(chars = {'{', ' '})
++        if name.len == 0:
++          err(lineNo, "class needs a name")
++        cur = Class(name: name)
++        inClass = true
++        continue
++      if line in ["{", "}"]:
++        continue
++      err(lineNo, "unexpected: " & line)
++
++    if line == "{":
++      continue
++    if line == "}":
++      result.classes.add cur
++      inClass = false
++      continue
++
++    let open = line.find('(')
++    if open < 0:
++      err(lineNo, "unexpected: " & line)
++    let close = line.rfind(')')
++    if close < open:
++      err(lineNo, "unterminated `(` -- rep2nim needs one declaration per line")
++    let inner = line[open + 1 ..< close]
++
++    case keyword
++    of "PROP": cur.props.add parseProp(lineNo, inner)
++    of "SLOT": cur.slots.add parseCallable(lineNo, inner, isSignal = false)
++    of "SIGNAL": cur.signals.add parseCallable(lineNo, inner, isSignal = true)
++    else:
++      err(lineNo, "unknown declaration `" & keyword & "`")
++
++  if inClass:
++    err(0, &"unterminated class `{cur.name}` in {filename}")
++  if result.classes.len == 0:
++    err(0, &"no class found in {filename}")
++
++proc implName*(m: Method): string =
++  m.name & "Impl"
++
++proc signature(m: Method, className: string): string =
++  result = &"proc {m.name}*(self: {className}"
++  for p in m.params:
++    result.add &", {p.name}: {p.typ}"
++  result.add ")"
++  if m.returnType != "void":
++    result.add ": " & m.returnType
++
++proc implCall(m: Method): string =
++  result = "self." & m.implName() & "("
++  for i, p in m.params:
++    if i > 0:
++      result.add ", "
++    result.add p.name
++  result.add ")"
++
++proc generate*(rep: Rep, repPath, implModule: string): string =
++  ## Emit the nimside module for `rep`. `implModule` is `include`d inside the
++  ## `qobject:` block, ahead of the slots, so your procs can see the generated
++  ## types and property accessors.
++  let src = repPath.extractFilename()
++  result = &"""
++## Generated by rep2nim from {src} -- DO NOT EDIT.
++##
++## Implement the `*Impl` procs listed below in `{implModule}.nim`, as ordinary
++## procs with no pragmas.
++
++import nimside
++import seaqt/qobject
++
++qobject:
++  type
++"""
++
++  for c in rep.classes:
++    result.add &"    {c.name}* = ref object of VirtualQObject\n"
++    for p in c.props:
++      let (write, notify) =
++        case p.access
++        of Constant: ("false", "false")
++        # READONLY constrains the replica, not the source: the source still
++        # needs a setter to publish changes, and repc emits a change signal.
++        of ReadOnly, ReadWrite: ("true", "true")
++      result.add(
++        &"      {p.name} {{.qproperty(write = {write}, notify = {notify}).}}: {p.typ}" &
++          "\n"
++      )
++    if c.props.len == 0:
++      result.add "      discard\n"
++    result.add "\n"
++
++  result.add &"""  # Your implementations. Spliced in ahead of the slots that call them, so
++  # they can see the types above and their generated property accessors.
++  include "{implModule}"
++
++"""
++
++  # Everything below stays inside the `qobject:` block, hence the indent.
++  for c in rep.classes:
++    for m in c.signals:
++      result.add "  " & signature(m, c.name) & " {.signal.}\n"
++    if c.signals.len > 0:
++      result.add "\n"
++    for m in c.slots:
++      result.add "  " & signature(m, c.name) & " {.slot.} =\n"
++      result.add "    " & implCall(m) & "\n\n"
++
++proc implStub*(rep: Rep, implModule: string): string =
++  ## A starting point for the implementation module: one stub per slot.
++  result = &"""
++## Implementations for the slots declared in the generated rep2nim module.
++##
++## Included into its `qobject:` block, so the generated types and their
++## property accessors are in scope. Plain procs, no pragmas.
++
++"""
++  for c in rep.classes:
++    for m in c.slots:
++      var sig = &"proc {m.implName()}*(self: {c.name}"
++      for p in m.params:
++        sig.add &", {p.name}: {p.typ}"
++      sig.add ")"
++      if m.returnType != "void":
++        sig.add ": " & m.returnType
++      result.add sig & " =\n"
++      result.add "  discard # TODO\n\n"
+diff --git a/src/rep2nim.nim b/src/rep2nim.nim
+new file mode 100644
+index 0000000..5b1a051
+--- /dev/null
++++ b/src/rep2nim.nim
+@@ -0,0 +1,85 @@
++## rep2nim -- generate nimside sources from a Qt Remote Objects `.rep` file.
++##
++##   rep2nim counter.rep                      # -> counter_rep.nim
++##   rep2nim counter.rep -o src/counter.nim
++##   rep2nim counter.rep --impl:counter_logic # module to include for the bodies
++##   rep2nim counter.rep --stub               # also write the impl stub, if absent
++
++import std/[os, parseopt, strformat]
++import nimside/rep2nim
++
++const usage =
++  """
++rep2nim -- repc for nimside
++
++  rep2nim <file.rep> [options]
++
++Options:
++  -o, --out:<path>    output module (default: <file>_rep.nim next to the input)
++      --impl:<module> module included for the slot bodies
++                      (default: <file>_impl)
++      --stub          also write <impl>.nim with one stub per slot,
++                      if it does not already exist
++  -h, --help
++"""
++
++proc main() =
++  var
++    repPath = ""
++    outPath = ""
++    implModule = ""
++    writeStub = false
++
++  for kind, key, val in getopt():
++    case kind
++    of cmdArgument:
++      if repPath.len > 0:
++        quit "rep2nim: one .rep at a time (got '" & key & "' as well)", 2
++      repPath = key
++    of cmdLongOption, cmdShortOption:
++      case key
++      of "o", "out": outPath = val
++      of "impl": implModule = val
++      of "stub": writeStub = true
++      of "h", "help":
++        echo usage
++        quit 0
++      else:
++        quit "rep2nim: unknown option --" & key & "\n\n" & usage, 2
++    of cmdEnd: discard
++
++  if repPath.len == 0:
++    quit usage, 2
++  if not repPath.fileExists():
++    quit "rep2nim: no such file: " & repPath, 2
++
++  let
++    dir = repPath.parentDir()
++    stem = repPath.extractFilename().changeFileExt("")
++  if outPath.len == 0:
++    outPath = dir / (stem & "_rep.nim")
++  if implModule.len == 0:
++    implModule = stem & "_impl"
++
++  let source = readFile(repPath)
++  var rep: Rep
++  try:
++    rep = parseRep(source, repPath)
++  except Rep2NimError as e:
++    let where = if e.line > 0: &"{repPath}({e.line})" else: repPath
++    quit &"{where}: {e.msg}", 1
++
++  createDir(outPath.parentDir())
++  writeFile(outPath, generate(rep, repPath, implModule))
++  echo "rep2nim: wrote ", outPath
++
++  if writeStub:
++    let stubPath = outPath.parentDir() / (implModule & ".nim")
++    if stubPath.fileExists():
++      echo "rep2nim: keeping existing ", stubPath
++    else:
++      writeFile(stubPath, implStub(rep, implModule))
++      echo "rep2nim: wrote ", stubPath
++
++when isMainModule:
++  main()
+diff --git a/tests/test_all.nim b/tests/test_all.nim
+index 55c5c63..14b19f9 100644
+--- a/tests/test_all.nim
++++ b/tests/test_all.nim
+@@ -1,2 +1,3 @@
+ import
+-  ./test_metaobjectgen
++  ./test_metaobjectgen,
++  ./test_rep2nim
+diff --git a/tests/test_rep2nim.nim b/tests/test_rep2nim.nim
+new file mode 100644
+index 0000000..b7d26e6
+--- /dev/null
++++ b/tests/test_rep2nim.nim
+@@ -0,0 +1,206 @@
++import nimside/rep2nim, std/[sequtils, strutils], unittest2
++
++proc parse(s: string): Rep =
++  parseRep(s, "test.rep")
++
++proc failure(s: string): string =
++  try:
++    discard parseRep(s, "test.rep")
++    ""
++  except Rep2NimError as e:
++    e.msg
++
++suite "rep2nim parsing":
++  test "class with a property and a slot":
++    let rep = parse(
++      """
++class Counter
++{
++    PROP(int count READONLY)
++
++    SLOT(void increment())
++}
++"""
++    )
++    check rep.classes.len == 1
++    let c = rep.classes[0]
++    check c.name == "Counter"
++    check c.props.len == 1
++    check c.props[0].name == "count"
++    check c.props[0].access == ReadOnly
++    check c.slots.len == 1
++    check c.slots[0].name == "increment"
++    check c.slots[0].returnType == "void"
++    check c.slots[0].params.len == 0
++
++  test ".rep int is 32-bit, so it must not become Nim's int":
++    # Nim's `int` is 64-bit and would reach the meta object as qlonglong,
++    # silently mismatching every replica generated from the same .rep.
++    let c = parse("class C\n{\n    PROP(int n)\n}\n").classes[0]
++    check c.props[0].typ == "int32"
++
++  test "type mapping":
++    let c = parse(
++      """
++class C
++{
++    PROP(QString s)
++    PROP(QStringList l)
++    PROP(bool b)
++    PROP(double d)
++    PROP(qint64 big)
++    PROP(quint16 small)
++}
++"""
++    ).classes[0]
++    check c.props.mapIt(it.typ) ==
++      @["string", "seq[string]", "bool", "float64", "int64", "uint16"]
++
++  test "property flags":
++    let c = parse(
++      """
++class C
++{
++    PROP(int a)
++    PROP(int b READONLY)
++    PROP(int c CONSTANT)
++    PROP(int d READWRITE)
++    PROP(int e SOURCEONLYSETTER)
++}
++"""
++    ).classes[0]
++    check c.props.mapIt(it.access) ==
++      @[ReadWrite, ReadOnly, Constant, ReadWrite, ReadWrite]
++
++  test "a default value is dropped -- the source initialises its own fields":
++    let c = parse("class C\n{\n    PROP(int n=5)\n}\n").classes[0]
++    check c.props[0].name == "n"
++    check c.props[0].typ == "int32"
++
++  test "slots with parameters and a return type":
++    let c = parse(
++      """
++class C
++{
++    SLOT(int add(int a, int b))
++    SLOT(void take(QString s))
++}
++"""
++    ).classes[0]
++    check c.slots[0].name == "add"
++    check c.slots[0].returnType == "int32"
++    check c.slots[0].params.mapIt(it.name) == @["a", "b"]
++    check c.slots[0].params.mapIt(it.typ) == @["int32", "int32"]
++    check c.slots[1].returnType == "void"
++    check c.slots[1].params[0].typ == "string"
++
++  test "an unnamed parameter gets a positional name":
++    let c = parse("class C\n{\n    SLOT(void f(int))\n}\n").classes[0]
++    check c.slots[0].params[0].name == "arg0"
++
++  test "signals have no return type":
++    let c = parse("class C\n{\n    SIGNAL(changed(int v))\n}\n").classes[0]
++    check c.signals.len == 1
++    check c.signals[0].name == "changed"
++    check c.signals[0].returnType == "void"
++    check c.signals[0].params[0].name == "v"
++
++  test "comments and #include lines are ignored":
++    let c = parse(
++      """
++#include <QString>
++// leading comment
++class C
++{
++    PROP(int n) // trailing comment
++}
++"""
++    ).classes[0]
++    check c.props.len == 1
++
++  test "several classes keep their order":
++    let rep = parse(
++      "class A\n{\n    PROP(int a)\n}\nclass B\n{\n    PROP(int b)\n}\n"
++    )
++    check rep.classes.mapIt(it.name) == @["A", "B"]
++
++suite "rep2nim rejects what it cannot represent":
++  test "constructs repc supports but nimside cannot":
++    # Rejected by name rather than silently dropped.
++    for kw in ["POD Point(int x, int y)", "USE_ENUM(Foo)"]:
++      check failure(kw & "\n").contains("not supported")
++    for kw in ["ENUM E { A, B }", "MODEL m(role)", "CLASS sub(Other)"]:
++      check failure("class C\n{\n    " & kw & "\n}\n").contains("not supported")
++
++  test "an unmapped type is an error, not a guess":
++    let msg = failure("class C\n{\n    PROP(QColor c)\n}\n")
++    check msg.contains("QColor")
++    check msg.contains("unsupported type")
++
++  test "a slot must declare a return type":
++    check failure("class C\n{\n    SLOT(doIt())\n}\n").contains("return type")
++
++  test "a signal must not declare one":
++    check failure("class C\n{\n    SIGNAL(void changed())\n}\n").
++      contains("must not declare a return type")
++
++  test "unterminated class":
++    check failure("class C\n{\n    PROP(int n)\n").contains("unterminated")
++
++  test "no class at all":
++    check failure("\n// nothing here\n").contains("no class")
++
++  test "the error carries a line number":
++    try:
++      discard parseRep("class C\n{\n    PROP(QColor c)\n}\n", "test.rep")
++      check false
++    except Rep2NimError as e:
++      check e.line == 3
++
++suite "rep2nim generation":
++  let rep = parse(
++    """
++class Counter
++{
++    PROP(int count READONLY)
++    PROP(QString label CONSTANT)
++
++    SIGNAL(bumped(int by))
++    SLOT(void increment())
++    SLOT(int addTo(int base))
++}
++"""
++  )
++  let src = generate(rep, "counter.rep", "counter_impl")
++
++  test "emits a qobject block with the type and its properties":
++    check src.contains("qobject:")
++    check src.contains("Counter* = ref object of VirtualQObject")
++    check src.contains("count {.qproperty(write = true, notify = true).}: int32")
++
++  test "CONSTANT means no setter and no notify":
++    check src.contains("label {.qproperty(write = false, notify = false).}: string")
++
++  test "READONLY still gets a setter -- it constrains the replica, not the source":
++    check src.contains("count {.qproperty(write = true, notify = true).}")
++
++  test "includes the impl module ahead of the slots that call it":
++    let inc = src.find("include \"counter_impl\"")
++    let slot = src.find("proc increment*")
++    check inc >= 0
++    check slot > inc
++
++  test "slots forward to *Impl and stay inside the block":
++    check src.contains("  proc increment*(self: Counter) {.slot.} =\n" &
++      "    self.incrementImpl()")
++    check src.contains("  proc addTo*(self: Counter, base: int32): int32 {.slot.} =\n" &
++      "    self.addToImpl(base)")
++
++  test "signals are declared without a body":
++    check src.contains("  proc bumped*(self: Counter, by: int32) {.signal.}")
++
++  test "the stub declares one proc per slot":
++    let stub = implStub(rep, "counter_impl")
++    check stub.contains("proc incrementImpl*(self: Counter) =")
++    check stub.contains("proc addToImpl*(self: Counter, base: int32): int32 =")
++    check not stub.contains("bumped")
