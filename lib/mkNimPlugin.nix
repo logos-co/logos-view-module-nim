@@ -69,7 +69,12 @@
     inherit src;
 
     nativeBuildInputs = common.commonNativeBuildInputs pkgs
-      ++ lib.optional (repFile != null) rep2nim;
+      ++ lib.optionals (repFile != null) [
+        rep2nim
+        # repc lives in qtremoteobjects' libexec, not on PATH.
+        (pkgs.writeShellScriptBin "repc"
+          ''exec ${pkgs.qt6.qtremoteobjects}/libexec/repc "$@"'')
+      ];
     buildInputs = common.commonBuildInputs pkgs;
 
     dontConfigure = true;
@@ -92,8 +97,25 @@
       echo "Qt6Core $(pkg-config --modversion Qt6Core) via pkg-config"
 
       ${lib.optionalString (repFile != null) ''
+        # The QtRemoteObjects interface signature, lifted out of the replica
+        # repc generates from this same .rep rather than recomputed. An empty
+        # signature tells QtRemoteObjects not to verify the interface at all, so
+        # a source/replica mismatch would show up as silently wrong data instead
+        # of SignatureMismatch -- and a hash computed here would have to track
+        # repc's algorithm across Qt versions to stay compatible.
+        repc -i rep -o replica ${repFile} $TMPDIR/rep_replica.h
+        LOGOS_RO_SIGNATURE=$(sed -n \
+          's/.*QCLASSINFO_REMOTEOBJECT_SIGNATURE, "\([0-9a-f]*\)".*/\1/p' \
+          $TMPDIR/rep_replica.h | head -1)
+        if [ -z "$LOGOS_RO_SIGNATURE" ]; then
+          echo "error: no interface signature in repc's output for ${repFile}" >&2
+          exit 1
+        fi
+        echo "interface signature: $LOGOS_RO_SIGNATURE"
+
         echo "rep2nim: ${repFile} -> ${nimDir}/${genMod}.nim"
-        rep2nim ${repFile} --out:${nimDir}/${genMod}.nim --impl:${implMod}
+        rep2nim ${repFile} --out:${nimDir}/${genMod}.nim --impl:${implMod} \
+          --signature:"$LOGOS_RO_SIGNATURE"
       ''}
 
       nim c \

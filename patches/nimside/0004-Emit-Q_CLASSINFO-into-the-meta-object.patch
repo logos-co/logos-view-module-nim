@@ -1,0 +1,291 @@
+From bbb24a408bf65528970e8f439307e53e958cc5ce Mon Sep 17 00:00:00 2001
+From: Dario Gabriel Lipicar <lipigl@gmail.com>
+Date: Thu, 30 Jul 2026 10:18:34 -0300
+Subject: [PATCH 4/5] Emit Q_CLASSINFO into the meta object
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The class-info section was a stub -- `block: # classinfo / discard` -- with the
+header offsets defined but never filled, so a nimside object carried no class
+info at all and `QMetaObject::classInfo()` had nothing to report.
+
+Qt reads a handful of these itself, and their absence is not always a quiet
+one. QtRemoteObjects identifies an interface by "RemoteObject Type" and
+"RemoteObject Signature", and takes an empty signature to mean "dynamic, do not
+check": QRemoteObjectNodePrivate::checkSignatures returns true whenever either
+side is empty. A remoted nimside object therefore skipped signature validation
+entirely, and an interface mismatch against a repc-generated replica surfaced as
+silently wrong data instead of SignatureMismatch. QML looks for
+"DefaultProperty" in the same table.
+
+Add a `{.qclassinfo("name", "value", …).}` pragma on the type, carry the entries
+through to genMetaObjectData, and write the section. It goes first in the data
+array, where moc puts it, so every following section's offset shifts past it --
+hence the test that methods and properties still resolve alongside class info,
+which is what an offset mistake would break.
+
+tests/test_all: 49 OK.
+---
+ src/nimside.nim               | 49 +++++++++++++++++++++++++++++++--
+ src/nimside/metaobjectgen.nim | 29 +++++++++++++++-----
+ tests/test_metaobjectgen.nim  | 51 ++++++++++++++++++++++++++++++++++-
+ 3 files changed, 120 insertions(+), 9 deletions(-)
+
+diff --git a/src/nimside.nim b/src/nimside.nim
+index 4da4c7f..23ce5a3 100644
+--- a/src/nimside.nim
++++ b/src/nimside.nim
+@@ -31,6 +31,17 @@ template qproperty*(write = true, notify = true) {.pragma.}
+ template slot*() {.pragma.}
+ template signal*() {.pragma.}
+ 
++template qclassinfo*(pairs: varargs[string]) {.pragma.}
++  ## `Q_CLASSINFO` entries for the type, as a flat list of name/value pairs:
++  ##
++  ## .. code-block:: nim
++  ##   type Counter {.qclassinfo("RemoteObject Type", "Counter").} =
++  ##     ref object of VirtualQObject
++  ##
++  ## Qt itself reads a handful of these -- QtRemoteObjects keys interface
++  ## identity off "RemoteObject Type" and "RemoteObject Signature", and QML
++  ## looks for "DefaultProperty" -- and they are otherwise free for the taking.
++
+ template titleCase(s: string): string =
+   s[0].toUpperAscii() & s[1 ..^ 1]
+ 
+@@ -84,6 +95,10 @@ type
+     typ: NimNode
+     def: PropertyDef
+ 
++  NimClassInfoDef = object
++    name: NimNode
++    value: NimNode
++
+   NimTypeDef = object
+     n: NimNode
+     objTyp: NimNode
+@@ -98,6 +113,7 @@ type
+     # QtRemoteObjects' DynamicApiMap replicates every slot, and QML's
+     # QQmlPropertyCache would see `foo` as both a property and a method.
+     accessors: seq[NimMethodDef]
++    classInfos: seq[NimClassInfoDef]
+ 
+ proc isVoid(v: NimNode): bool =
+   v.kind == nnkEmpty or "void".eqIdent(v)
+@@ -142,6 +158,13 @@ proc toPropDef(v: NimPropDef): NimNode =
+       notifySignal: `notifySignal`,
+     )
+ 
++proc toClassInfoDef(v: NimClassInfoDef): NimNode =
++  let
++    name = v.name
++    value = v.value
++  quote:
++    ClassInfoDef(name: `name`, value: `value`)
++
+ proc store[T](ret: T, where: var pointer) =
+   when ret is ref:
+     if ret == nil:
+@@ -226,6 +249,25 @@ proc readType(n: NimNode): NimTypeDef =
+         error("Expected type, got " & $typ[2].kind, typ)
+     records = objTyp[2]
+ 
++  # Q_CLASSINFO entries, from a `{.qclassinfo("k", "v", …).}` pragma on the type.
++  var classInfos: seq[NimClassInfoDef]
++  if n[0].kind == nnkPragmaExpr:
++    let ci = findPragma(n[0][1], "qclassinfo")
++    if ci != nil:
++      let args = ci[0]
++      if args.kind != nnkCall or args.len < 3:
++        error("qclassinfo expects at least one name/value pair", ci)
++      if (args.len - 1) mod 2 != 0:
++        error("qclassinfo takes name/value pairs, got an odd number of arguments", ci)
++      var i = 1
++      while i < args.len:
++        for side in [args[i], args[i + 1]]:
++          if side.kind != nnkStrLit:
++            error("qclassinfo arguments must be string literals, got " &
++              repr(side), side)
++        classInfos.add NimClassInfoDef(name: args[i], value: args[i + 1])
++        i += 2
++
+   var props: seq[NimPropDef]
+   if records.kind == nnkRecList:
+     for rec in records:
+@@ -276,7 +318,7 @@ proc readType(n: NimNode): NimTypeDef =
+             )
+           )
+ 
+-  NimTypeDef(n: n, objTyp: objTyp, props: props)
++  NimTypeDef(n: n, objTyp: objTyp, props: props, classInfos: classInfos)
+ 
+ type NimProcDef = object
+   n: NimNode
+@@ -546,6 +588,7 @@ proc processType(p: var NimTypeDef): (NimNode, NimNode) =
+     signalsLit = nnkBracket.newTree(p.signals.mapIt(it.toMethodDef(isSignal = true)))
+     slotsLit = nnkBracket.newTree(p.slots.mapIt(it.toMethodDef(isSignal = false)))
+     propsLit = nnkBracket.newTree(p.props.mapIt(it.toPropDef()))
++    classInfosLit = nnkBracket.newTree(p.classInfos.mapIt(it.toClassInfoDef()))
+     typNameLit = newLit(className)
+     metaObjectInst = ident(className & "MetaObjectInstance")
+ 
+@@ -553,7 +596,9 @@ proc processType(p: var NimTypeDef): (NimNode, NimNode) =
+       var `metaObjectInst` {.global.}: pointer
+       proc `staticMetaObject`*(_: type `typName`): gen_qobjectdefs_types.QMetaObject =
+         const (data, stringdata, metaTypes) =
+-          genMetaObjectData(`typNameLit`, `signalsLit`, `slotsLit`, `propsLit`)
++          genMetaObjectData(
++            `typNameLit`, `signalsLit`, `slotsLit`, `propsLit`, `classInfosLit`
++          )
+         if `metaObjectInst` == nil:
+           var tmp = createMetaObject(
+             gen_qobject.staticMetaObject(gen_qobject_types.QObject),
+diff --git a/src/nimside/metaobjectgen.nim b/src/nimside/metaobjectgen.nim
+index 821210c..b219433 100644
+--- a/src/nimside/metaobjectgen.nim
++++ b/src/nimside/metaobjectgen.nim
+@@ -119,11 +119,16 @@ type
+     metaType*: string
+     readSlot*, writeSlot*, notifySignal*: string
+ 
++  ClassInfoDef* = object ## A `Q_CLASSINFO` entry.
++    name*: string
++    value*: string
++
+   QObjectDef* = object
+     name*: string
+     signals*: seq[MethodDef]
+     slots*: seq[MethodDef]
+     properties*: seq[PropertyDef]
++    classInfos*: seq[ClassInfoDef]
+ 
+ type QBuiltinMetaType* {.pure.} = enum
+   ## Built-in metatypes to avoid the runtime name-based lookup that we otherwise
+@@ -287,6 +292,7 @@ proc genMetaObjectData*(
+     signals: openArray[MethodDef],
+     slots: openArray[MethodDef],
+     props: openArray[PropertyDef],
++    classInfos: openArray[ClassInfoDef] = [],
+ ): (seq[cuint], seq[byte], seq[string]) =
+   # Class names need to be globally unique
+   # TODO use something other than a thread var
+@@ -313,11 +319,12 @@ proc genMetaObjectData*(
+     methods = @signals & @slots
+     methodCount = cuint(methods.len())
+     propertyCount = cuint(props.len())
++    classInfoCount = cuint(classInfos.len())
+     methodParamsSize = cuint(foldl(methods, a + b.params.len, 0)) * 2 + methodCount
+ 
+     metaSize =
+-      QMetaObjectPrivateElems + methodCount * methodSize + methodParamsSize +
+-      cuint(props.len) * propSize + 1
++      QMetaObjectPrivateElems + classInfoCount * 2 + methodCount * methodSize +
++      methodParamsSize + cuint(props.len) * propSize + 1
+ 
+   var metaTypes: seq[string]
+   template addMetaType(s: string): uint32 =
+@@ -366,11 +373,15 @@ proc genMetaObjectData*(
+     else:
+       cuint id
+ 
+-  block: # classinfo
+-    discard
+-
+   block: # private data
+     data[classNamePos] = addString(className)
++
++    # Class info comes first in the data array, as moc emits it -- everything
++    # below is offset past it.
++    data[classInfoCountPos] = classInfoCount
++    data[classInfoDataPos] = if classInfoCount == 0: 0 else: dataIndex
++    dataIndex += classInfoCount * 2
++
+     data[methodCountPos] = methodCount
+     data[methodDataPos] = if methodCount == 0: 0 else: dataIndex
+     dataIndex += methodSize * methodCount
+@@ -391,6 +402,11 @@ proc genMetaObjectData*(
+     for p in props:
+       discard addMetaType(p.metaType)
+ 
++  block: # Class info
++    for ci in classInfos:
++      addData(addString(ci.name))
++      addData(addString(ci.value))
++
+   block: # Methods and their parameters
+     for m in methods:
+       addData(addString(m.name))
+@@ -576,7 +592,8 @@ proc genMetaObject*(
+     className: string,
+     signals, slots: openArray[MethodDef],
+     props: openArray[PropertyDef],
++    classInfos: openArray[ClassInfoDef] = [],
+ ): gen_qobjectdefs_types.QMetaObject =
+   let (data, stringdata, metaTypes) =
+-    genMetaObjectData(className, signals, slots, props)
++    genMetaObjectData(className, signals, slots, props, classInfos)
+   createMetaObject(superclassMetaObject, data, stringdata, metaTypes)
+diff --git a/tests/test_metaobjectgen.nim b/tests/test_metaobjectgen.nim
+index f5f8d11..1e9fd3d 100644
+--- a/tests/test_metaobjectgen.nim
++++ b/tests/test_metaobjectgen.nim
+@@ -1,4 +1,4 @@
+-import nimside/metaobjectgen, seaqt/[qobject], unittest2
++import nimside/metaobjectgen, seaqt/[qobject], seaqt/QtCore/gen_qmetaobject, unittest2
+ 
+ suite "genMetaObject Tests":
+   test "Simple signal":
+@@ -446,3 +446,52 @@ suite "genMetaObject Tests":
+     check(offset >= 0)
+     check(totalCount > 0)
+     check(totalCount >= offset + 1)
++
++  test "Class info":
++    let cis = @[
++      ClassInfoDef(name: "RemoteObject Type", value: "Counter"),
++      ClassInfoDef(name: "RemoteObject Signature", value: "deadbeef"),
++    ]
++    let mo = genMetaObject(QObject.staticMetaObject, "TestClassInfo", [], [], [], cis)
++
++    check(mo.classInfoCount() - mo.classInfoOffset() == 2)
++    check $mo.classInfo(mo.classInfoOffset() + 0).name() == "RemoteObject Type"
++    check $mo.classInfo(mo.classInfoOffset() + 0).value() == "Counter"
++    check $mo.classInfo(mo.classInfoOffset() + 1).name() == "RemoteObject Signature"
++    check $mo.classInfo(mo.classInfoOffset() + 1).value() == "deadbeef"
++
++  test "Class info does not disturb the sections after it":
++    # Class info sits first in the data array, so every other section's offset
++    # shifts past it -- a mistake here corrupts methods and properties rather
++    # than just the class info.
++    let
++      sigs = @[MethodDef.signalDef("countChanged", @[])]
++      slots = @[MethodDef.slotDef("increment", "void", @[])]
++      props =
++        @[
++          PropertyDef(
++            name: "count",
++            metaType: "int",
++            readSlot: "count",
++            writeSlot: "setCount",
++            notifySignal: "countChanged",
++          )
++        ]
++      cis = @[ClassInfoDef(name: "K", value: "V")]
++      mo = genMetaObject(QObject.staticMetaObject, "TestMixed", sigs, slots, props, cis)
++
++    check(mo.classInfoCount() - mo.classInfoOffset() == 1)
++    check(mo.methodCount() - mo.methodOffset() == 2)
++    check(mo.indexOfSignal("countChanged()") >= 0)
++    check(mo.indexOfSlot("increment()") >= 0)
++    check(mo.propertyCount() - mo.propertyOffset() == 1)
++
++    let prop = mo.property(mo.indexOfProperty("count"))
++    check $prop.name() == "count"
++    check prop.hasNotifySignal()
++    # seaqt hands back a QByteArray as seq[byte].
++    check cast[string](prop.notifySignal().methodSignature()) == "countChanged()"
++
++  test "No class info is still valid":
++    let mo = genMetaObject(QObject.staticMetaObject, "TestNoClassInfo", [], [], [])
++    check(mo.classInfoCount() - mo.classInfoOffset() == 0)

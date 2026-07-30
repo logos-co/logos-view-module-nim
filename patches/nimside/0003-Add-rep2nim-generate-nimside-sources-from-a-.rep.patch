@@ -1,7 +1,7 @@
 From adce40db4bbfe9d0e84b00e59a6e3ea13d260545 Mon Sep 17 00:00:00 2001
 From: Dario Gabriel Lipicar <lipigl@gmail.com>
 Date: Thu, 30 Jul 2026 00:19:38 -0300
-Subject: [PATCH 3/3] Add rep2nim: generate nimside sources from a .rep
+Subject: [PATCH 3/5] Add rep2nim: generate nimside sources from a .rep
 
 repc turns a Qt Remote Objects .rep into a C++ source-side class. rep2nim does
 the same for nimside, so a single .rep can define an interface shared between a
