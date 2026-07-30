@@ -51,6 +51,15 @@
 
       # Pre-fill the sources so callers only supply their own module.
       wrappedLib = rawLib // {
+        # Backend entry point with nimside/nim-seaqt already resolved, so
+        # logos-module-builder passes only the module.
+        buildPlugin = args:
+          let pkgs = args.pkgs; in
+          rawLib.buildPlugin (args // {
+            nimside = rawLib.patchedNimside { inherit pkgs; nimsideSrc = nimside; };
+            nimSeaqt = nim-seaqt;
+          });
+
         mkNimUiPlugin = args:
           let pkgs = args.pkgs; in
           rawLib.mkNimUiPlugin.build (args // {
@@ -66,10 +75,19 @@
             nimSeaqt = nim-seaqt;
           });
       };
+
+      # The sources this backend is pinned to, so logos-module-builder can
+      # resolve them once and inject them, the way it injects the SDK into
+      # logos-plugin-qt rather than letting the backend fetch its own.
+      backendSources = { pkgs }: {
+        nimside = rawLib.patchedNimside { inherit pkgs; nimsideSrc = nimside; };
+        nimSeaqt = nim-seaqt;
+      };
     in
     {
       lib = wrappedLib;
       rawLib = rawLib;
+      inherit backendSources;
 
       packages = forAllSystems ({ pkgs, ... }: {
         # nimside's .rep -> Nim generator, exposed so it can be run by hand.
