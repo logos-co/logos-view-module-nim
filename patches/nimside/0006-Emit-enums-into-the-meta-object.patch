@@ -1,7 +1,7 @@
-From f6f2c4b549b544852a8ebb912f8df699954af181 Mon Sep 17 00:00:00 2001
+From 4bb7760bc901a3e3bb3f3c4d8f4cf4d6d268eda8 Mon Sep 17 00:00:00 2001
 From: Dario Gabriel Lipicar <lipigl@gmail.com>
 Date: Thu, 30 Jul 2026 10:32:53 -0300
-Subject: [PATCH 5/5] Emit enums into the meta object
+Subject: [PATCH 6/6] Emit enums into the meta object
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
 Content-Transfer-Encoding: 8bit
@@ -46,14 +46,14 @@ slot, and `{.qclassinfo(…), qenums(…).}` silently lost the second pragma.
 
 tests/test_all: 64 OK.
 ---
- README.md                     |  42 ++++++++-
- src/nimside.nim               | 170 ++++++++++++++++++++++++++++++----
- src/nimside/metaobjectgen.nim |  90 +++++++++++++++++-
- src/nimside/rep2nim.nim       | 127 +++++++++++++++++++++----
+ README.md                     |  42 +++++++++-
+ src/nimside.nim               | 153 +++++++++++++++++++++++++++++++---
+ src/nimside/metaobjectgen.nim |  90 +++++++++++++++++++-
+ src/nimside/rep2nim.nim       | 127 ++++++++++++++++++++++++----
  src/rep2nim.nim               |   9 +-
- tests/test_metaobjectgen.nim  |  79 ++++++++++++++++
- tests/test_rep2nim.nim        |  79 +++++++++++++++-
- 7 files changed, 554 insertions(+), 42 deletions(-)
+ tests/test_metaobjectgen.nim  |  79 ++++++++++++++++++
+ tests/test_rep2nim.nim        |  79 +++++++++++++++++-
+ 7 files changed, 543 insertions(+), 36 deletions(-)
 
 diff --git a/README.md b/README.md
 index b93024e..748b71c 100644
@@ -109,7 +109,7 @@ index b93024e..748b71c 100644
  ## Related projects
  
 diff --git a/src/nimside.nim b/src/nimside.nim
-index 23ce5a3..5297adf 100644
+index 5c518a7..5297adf 100644
 --- a/src/nimside.nim
 +++ b/src/nimside.nim
 @@ -25,7 +25,14 @@ template declareMemCpy(T: type, v: untyped, p: pointer) =
@@ -154,26 +154,20 @@ index 23ce5a3..5297adf 100644
  template titleCase(s: string): string =
    s[0].toUpperAscii() & s[1 ..^ 1]
  
-@@ -64,10 +90,16 @@ proc extractTypeImpl(n: NimNode): NimNode =
-     error("Invalid node to retrieve type implementation of: " & $n.kind)
- 
+@@ -66,9 +92,9 @@ proc extractTypeImpl(n: NimNode): NimNode =
  proc findPragma(n: NimNode, name: string): NimNode =
-+  ## The matching entry within a pragma block, or nil.
-+  ##
+   ## The matching entry within a pragma block, or nil.
+   ##
+-  ## Every entry is considered, not just the first: `{.slot, raises: [].}` is
+-  ## ordinary Nim, and only looking at index zero quietly ignores whatever
+-  ## comes after it.
 +  ## Every entry is considered, not just the first: `{.slot, raises: [].}` and
 +  ## `{.qclassinfo(…), qenums(…).}` are ordinary Nim, and only looking at index
 +  ## zero quietly ignores whatever comes after it.
    case n.kind
    of nnkPragma:
--    if name.eqIdent(n[0]) or n[0].kind == nnkCall and name.eqIdent(n[0][0]):
--      return n
-+    for entry in n:
-+      if name.eqIdent(entry) or entry.kind == nnkCall and name.eqIdent(entry[0]):
-+        return entry
-   else:
-     for nn in n:
-       let x = findPragma(nn, name)
-@@ -99,6 +131,15 @@ type
+     for entry in n:
+@@ -105,6 +131,15 @@ type
      name: NimNode
      value: NimNode
  
@@ -189,7 +183,7 @@ index 23ce5a3..5297adf 100644
    NimTypeDef = object
      n: NimNode
      objTyp: NimNode
-@@ -114,6 +155,8 @@ type
+@@ -120,6 +155,8 @@ type
      # QQmlPropertyCache would see `foo` as both a property and a method.
      accessors: seq[NimMethodDef]
      classInfos: seq[NimClassInfoDef]
@@ -198,7 +192,7 @@ index 23ce5a3..5297adf 100644
  
  proc isVoid(v: NimNode): bool =
    v.kind == nnkEmpty or "void".eqIdent(v)
-@@ -123,7 +166,7 @@ proc toParamDef(v: NimParamDef): NimNode =
+@@ -129,7 +166,7 @@ proc toParamDef(v: NimParamDef): NimNode =
      name = newLit($v.name)
      typ = v.typ
    quote:
@@ -207,7 +201,7 @@ index 23ce5a3..5297adf 100644
  
  proc toMethodDef(v: NimMethodDef, isSignal: bool): NimNode =
    let
-@@ -140,7 +183,7 @@ proc toMethodDef(v: NimMethodDef, isSignal: bool): NimNode =
+@@ -146,7 +183,7 @@ proc toMethodDef(v: NimMethodDef, isSignal: bool): NimNode =
          v.returnType
  
      quote:
@@ -216,7 +210,7 @@ index 23ce5a3..5297adf 100644
  
  proc toPropDef(v: NimPropDef): NimNode =
    let
-@@ -152,12 +195,61 @@ proc toPropDef(v: NimPropDef): NimNode =
+@@ -158,12 +195,61 @@ proc toPropDef(v: NimPropDef): NimNode =
    quote:
      PropertyDef(
        name: `name`,
@@ -279,7 +273,7 @@ index 23ce5a3..5297adf 100644
  proc toClassInfoDef(v: NimClassInfoDef): NimNode =
    let
      name = v.name
-@@ -166,7 +258,10 @@ proc toClassInfoDef(v: NimClassInfoDef): NimNode =
+@@ -172,7 +258,10 @@ proc toClassInfoDef(v: NimClassInfoDef): NimNode =
      ClassInfoDef(name: `name`, value: `value`)
  
  proc store[T](ret: T, where: var pointer) =
@@ -291,25 +285,7 @@ index 23ce5a3..5297adf 100644
      if ret == nil:
        where = nil
      else:
-@@ -252,13 +347,12 @@ proc readType(n: NimNode): NimTypeDef =
-   # Q_CLASSINFO entries, from a `{.qclassinfo("k", "v", …).}` pragma on the type.
-   var classInfos: seq[NimClassInfoDef]
-   if n[0].kind == nnkPragmaExpr:
--    let ci = findPragma(n[0][1], "qclassinfo")
--    if ci != nil:
--      let args = ci[0]
-+    let args = findPragma(n[0][1], "qclassinfo")
-+    if args != nil:
-       if args.kind != nnkCall or args.len < 3:
--        error("qclassinfo expects at least one name/value pair", ci)
-+        error("qclassinfo expects at least one name/value pair", args)
-       if (args.len - 1) mod 2 != 0:
--        error("qclassinfo takes name/value pairs, got an odd number of arguments", ci)
-+        error("qclassinfo takes name/value pairs, got an odd number of arguments", args)
-       var i = 1
-       while i < args.len:
-         for side in [args[i], args[i + 1]]:
-@@ -268,6 +362,17 @@ proc readType(n: NimNode): NimTypeDef =
+@@ -273,6 +362,17 @@ proc readType(n: NimNode): NimTypeDef =
          classInfos.add NimClassInfoDef(name: args[i], value: args[i + 1])
          i += 2
  
@@ -327,18 +303,7 @@ index 23ce5a3..5297adf 100644
    var props: seq[NimPropDef]
    if records.kind == nnkRecList:
      for rec in records:
-@@ -282,8 +387,8 @@ proc readType(n: NimNode): NimTypeDef =
-             write = true
-             notify = true
- 
--          if qprop[0].kind == nnkCall:
--            for n in qprop[0][1 ..^ 1]:
-+          if qprop.kind == nnkCall:
-+            for n in qprop[1 ..^ 1]:
-               case n.kind
-               of nnkExprEqExpr:
-                 if "write".eqIdent(n[0]):
-@@ -318,7 +423,9 @@ proc readType(n: NimNode): NimTypeDef =
+@@ -323,7 +423,9 @@ proc readType(n: NimNode): NimTypeDef =
              )
            )
  
@@ -349,7 +314,7 @@ index 23ce5a3..5297adf 100644
  
  type NimProcDef = object
    n: NimNode
-@@ -589,6 +696,7 @@ proc processType(p: var NimTypeDef): (NimNode, NimNode) =
+@@ -594,6 +696,7 @@ proc processType(p: var NimTypeDef): (NimNode, NimNode) =
      slotsLit = nnkBracket.newTree(p.slots.mapIt(it.toMethodDef(isSignal = false)))
      propsLit = nnkBracket.newTree(p.props.mapIt(it.toPropDef()))
      classInfosLit = nnkBracket.newTree(p.classInfos.mapIt(it.toClassInfoDef()))
@@ -357,7 +322,7 @@ index 23ce5a3..5297adf 100644
      typNameLit = newLit(className)
      metaObjectInst = ident(className & "MetaObjectInstance")
  
-@@ -597,7 +705,8 @@ proc processType(p: var NimTypeDef): (NimNode, NimNode) =
+@@ -602,7 +705,8 @@ proc processType(p: var NimTypeDef): (NimNode, NimNode) =
        proc `staticMetaObject`*(_: type `typName`): gen_qobjectdefs_types.QMetaObject =
          const (data, stringdata, metaTypes) =
            genMetaObjectData(
@@ -367,7 +332,7 @@ index 23ce5a3..5297adf 100644
            )
          if `metaObjectInst` == nil:
            var tmp = createMetaObject(
-@@ -771,16 +880,41 @@ macro qobject*(body: untyped): untyped =
+@@ -776,16 +880,41 @@ macro qobject*(body: untyped): untyped =
  
    # Process all types first so as to avoid code ordering issues
    var typeDefs: seq[NimTypeDef]

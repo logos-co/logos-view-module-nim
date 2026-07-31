@@ -1,7 +1,7 @@
-From bbb24a408bf65528970e8f439307e53e958cc5ce Mon Sep 17 00:00:00 2001
+From b550284b3f88fea8964de6266349b293cdb0411b Mon Sep 17 00:00:00 2001
 From: Dario Gabriel Lipicar <lipigl@gmail.com>
 Date: Thu, 30 Jul 2026 10:18:34 -0300
-Subject: [PATCH 4/5] Emit Q_CLASSINFO into the meta object
+Subject: [PATCH 4/6] Emit Q_CLASSINFO into the meta object
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
 Content-Transfer-Encoding: 8bit
@@ -27,13 +27,13 @@ which is what an offset mistake would break.
 
 tests/test_all: 49 OK.
 ---
- src/nimside.nim               | 49 +++++++++++++++++++++++++++++++--
+ src/nimside.nim               | 48 +++++++++++++++++++++++++++++++--
  src/nimside/metaobjectgen.nim | 29 +++++++++++++++-----
  tests/test_metaobjectgen.nim  | 51 ++++++++++++++++++++++++++++++++++-
- 3 files changed, 120 insertions(+), 9 deletions(-)
+ 3 files changed, 119 insertions(+), 9 deletions(-)
 
 diff --git a/src/nimside.nim b/src/nimside.nim
-index 4da4c7f..23ce5a3 100644
+index eb24140..5c518a7 100644
 --- a/src/nimside.nim
 +++ b/src/nimside.nim
 @@ -31,6 +31,17 @@ template qproperty*(write = true, notify = true) {.pragma.}
@@ -54,7 +54,7 @@ index 4da4c7f..23ce5a3 100644
  template titleCase(s: string): string =
    s[0].toUpperAscii() & s[1 ..^ 1]
  
-@@ -84,6 +95,10 @@ type
+@@ -90,6 +101,10 @@ type
      typ: NimNode
      def: PropertyDef
  
@@ -65,7 +65,7 @@ index 4da4c7f..23ce5a3 100644
    NimTypeDef = object
      n: NimNode
      objTyp: NimNode
-@@ -98,6 +113,7 @@ type
+@@ -104,6 +119,7 @@ type
      # QtRemoteObjects' DynamicApiMap replicates every slot, and QML's
      # QQmlPropertyCache would see `foo` as both a property and a method.
      accessors: seq[NimMethodDef]
@@ -73,7 +73,7 @@ index 4da4c7f..23ce5a3 100644
  
  proc isVoid(v: NimNode): bool =
    v.kind == nnkEmpty or "void".eqIdent(v)
-@@ -142,6 +158,13 @@ proc toPropDef(v: NimPropDef): NimNode =
+@@ -148,6 +164,13 @@ proc toPropDef(v: NimPropDef): NimNode =
        notifySignal: `notifySignal`,
      )
  
@@ -87,20 +87,19 @@ index 4da4c7f..23ce5a3 100644
  proc store[T](ret: T, where: var pointer) =
    when ret is ref:
      if ret == nil:
-@@ -226,6 +249,25 @@ proc readType(n: NimNode): NimTypeDef =
+@@ -232,6 +255,24 @@ proc readType(n: NimNode): NimTypeDef =
          error("Expected type, got " & $typ[2].kind, typ)
      records = objTyp[2]
  
 +  # Q_CLASSINFO entries, from a `{.qclassinfo("k", "v", …).}` pragma on the type.
 +  var classInfos: seq[NimClassInfoDef]
 +  if n[0].kind == nnkPragmaExpr:
-+    let ci = findPragma(n[0][1], "qclassinfo")
-+    if ci != nil:
-+      let args = ci[0]
++    let args = findPragma(n[0][1], "qclassinfo")
++    if args != nil:
 +      if args.kind != nnkCall or args.len < 3:
-+        error("qclassinfo expects at least one name/value pair", ci)
++        error("qclassinfo expects at least one name/value pair", args)
 +      if (args.len - 1) mod 2 != 0:
-+        error("qclassinfo takes name/value pairs, got an odd number of arguments", ci)
++        error("qclassinfo takes name/value pairs, got an odd number of arguments", args)
 +      var i = 1
 +      while i < args.len:
 +        for side in [args[i], args[i + 1]]:
@@ -113,7 +112,7 @@ index 4da4c7f..23ce5a3 100644
    var props: seq[NimPropDef]
    if records.kind == nnkRecList:
      for rec in records:
-@@ -276,7 +318,7 @@ proc readType(n: NimNode): NimTypeDef =
+@@ -282,7 +323,7 @@ proc readType(n: NimNode): NimTypeDef =
              )
            )
  
@@ -122,7 +121,7 @@ index 4da4c7f..23ce5a3 100644
  
  type NimProcDef = object
    n: NimNode
-@@ -546,6 +588,7 @@ proc processType(p: var NimTypeDef): (NimNode, NimNode) =
+@@ -552,6 +593,7 @@ proc processType(p: var NimTypeDef): (NimNode, NimNode) =
      signalsLit = nnkBracket.newTree(p.signals.mapIt(it.toMethodDef(isSignal = true)))
      slotsLit = nnkBracket.newTree(p.slots.mapIt(it.toMethodDef(isSignal = false)))
      propsLit = nnkBracket.newTree(p.props.mapIt(it.toPropDef()))
@@ -130,7 +129,7 @@ index 4da4c7f..23ce5a3 100644
      typNameLit = newLit(className)
      metaObjectInst = ident(className & "MetaObjectInstance")
  
-@@ -553,7 +596,9 @@ proc processType(p: var NimTypeDef): (NimNode, NimNode) =
+@@ -559,7 +601,9 @@ proc processType(p: var NimTypeDef): (NimNode, NimNode) =
        var `metaObjectInst` {.global.}: pointer
        proc `staticMetaObject`*(_: type `typName`): gen_qobjectdefs_types.QMetaObject =
          const (data, stringdata, metaTypes) =
