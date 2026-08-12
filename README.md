@@ -1,4 +1,4 @@
-# logos-plugin-nim
+# logos-view-module-nim
 
 The Nim backend for Logos modules: builds a module's Qt plugin from Nim instead
 of C++, as a sibling to [`logos-plugin-qt`](https://github.com/logos-co/logos-plugin-qt).

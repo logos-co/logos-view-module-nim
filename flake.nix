@@ -1,5 +1,5 @@
 {
-  description = "Logos Nim Plugin Backend — builds Logos modules as Qt 6 plugins written in Nim";
+  description = "The Nim view-module backend — builds Logos modules as Qt 6 plugins written in Nim";
 
   inputs = {
     logos-nix.url = "github:logos-co/logos-nix";

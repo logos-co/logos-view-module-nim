@@ -10,7 +10,7 @@ let
   libExt = if pkgs.stdenv.hostPlatform.isDarwin then "dylib" else "so";
 in
 pkgs.stdenv.mkDerivation {
-  pname = "logos-plugin-nim-vanilla-test";
+  pname = "logos-view-module-nim-vanilla-test";
   version = "0.0.1";
 
   src = ./host;
