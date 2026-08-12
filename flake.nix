@@ -7,10 +7,7 @@
 
     # The Qt plugin backend. We use its logos_replica_factory() for the
     # host-side half of a view module; the backend half is ours.
-    # Absolute while this repo is local-only; becomes
-    # "github:logos-co/logos-plugin-qt" once both are registered in the
-    # workspace. Relative path: inputs are not resolved against the flake dir.
-    logos-plugin-qt.url = "path:/Users/dlipicar/repos/logos-workspace/repos/logos-plugin-qt";
+    logos-plugin-qt.url = "github:logos-co/logos-plugin-qt";
 
     # nimside: the meta object compiler. Pinned upstream plus the patch series
     # in patches/nimside -- see lib/nimside.nix.
